@@ -1,0 +1,506 @@
+# 5. Game Database
+
+## 5.1 게임 서버와 데이터 저장소
+
+게임 상태의 실시간 처리는 게임 서버가 담당하고, 영속 저장·캐싱·조회는 데이터베이스 및 관련 서비스가 담당한다. 데이터별로 일관성, 접근 패턴, 갱신 빈도와 장애 시 복구 요구사항을 구분해 저장소를 선택한다.
+
+## 5.2 RDBMS
+
+MySQL 또는 MariaDB를 중심으로 계정, 캐릭터, 아이템, 게임 결과 저장을 복습한다. 테이블·키·인덱스·트랜잭션의 적용과 Connection Pool, DB Worker, 비동기 저장 처리의 역할을 살펴본다.
+
+## 5.3 NoSQL
+
+Redis: 캐시, 로그인 세션의 보조 정보, 매치메이킹 보조 상태, 랭킹 등 저지연 접근에 적합한 활용 사례를 검토한다. 저장 방식과 영속성·장애 시 유실 가능성을 함께 확인한다.
+
+MongoDB: 유연한 스키마의 문서 데이터, 게임 기록 및 로그 데이터 등의 활용 사례를 살펴본다. 문서 모델, 인덱스, 조회 형태와 일관성 요구사항을 함께 검토한다.
+
+## 5.4 NewSQL / Distributed SQL
+
+TiDB, CockroachDB, YugabyteDB 등 분산 SQL 계열 시스템을 소개하고, 전통적인 RDBMS와 비교한다. 수평 확장, 분산 트랜잭션, 일관성, 지연 및 운영 복잡성을 중심으로 학습하며 교재의 최종 프로젝트에서 반드시 채택해야 하는 기술로 규정하지 않는다.
+
+## 5.5 게임 서버 적용
+
+로그인 및 계정 정보는 영속 DB에 저장하고, Room의 실시간 게임 상태는 Game Server 메모리에서 권한 있게 처리한다. 게임 결과를 저장할 때 데이터베이스 트랜잭션과 중복 처리 방지를 고려한다. Redis는 필요한 공유·캐시 용도로 제한하여 원본 데이터와 역할을 구분한다.
+
+## 5.6 분산 환경의 데이터 일관성
+
+서버가 여러 프로세스로 분리되면 같은 데이터를 서로 다른 시점에 읽거나 갱신할 수 있다. 영속 원본 데이터의 위치, 캐시 갱신과 무효화, 트랜잭션, 중복 요청, 멱등성, 읽기·쓰기 지연과 최종 일관성의 의미를 게임 결과 저장 사례를 통해 비교한다.
+
+실습에서는 RDBMS를 계정과 결과 데이터의 원본 저장소로 사용하고, Redis는 로비·Room 목록 등의 공유 정보 또는 캐시에 선택적으로 적용한다. NewSQL은 기존 방식과 비교하는 소개 범위로 유지한다.
+
+## 5.7 단계별 실습
+
+### 5.7.1 DB 단계별 실습
+
+**[검증 방식]** 5장도 같은 방식으로 검증한다. DB 기능을 호출하는 명령(/register, /login, /bonus, /score, /rank)을 가진 작은 콘솔 프로그램(DbShell)으로 먼저 시험하고, 검증된 DB 계층을 6장의 서버에 연결한다. 6장에서는 Unity 채팅 GUI의 버튼(로그인, 보너스 받기)이 같은 기능을 호출한다. 서버 로직이 바뀌면 SQL을 직접 실행하기 전에 이 명령과 버튼으로 먼저 확인한다. DB는 MySQL(또는 MariaDB), 캐시는 Redis이며 C++에서는 MySQL C API(libmysqlclient), OpenSSL, hiredis를 사용한다. 비밀번호는 평문으로 저장하지 않는다.
+
+실습 1 — 스키마와 SQL 검증: 계정, 보너스 기록, 게임 결과 테이블을 만들고 SQL로 먼저 트랜잭션과 중복 방지를 확인한다. 기본키와 UNIQUE 제약은 중복 요청을 서버 코드가 아니라 DB가 막아 주는 장치이다.
+
+```sql
+CREATE DATABASE IF NOT EXISTS gamedb DEFAULT CHARACTER SET utf8mb4;
+USE gamedb;
+
+CREATE TABLE IF NOT EXISTS account (
+    id       BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+    login    VARCHAR(32) NOT NULL UNIQUE,         -- 중복 가입을 DB가 막는다
+    pw_hash  CHAR(64) NOT NULL,                   -- PBKDF2 결과(16진수)
+    salt     CHAR(32) NOT NULL,                   -- 계정마다 다른 난수(16진수)
+    gold     INT NOT NULL DEFAULT 0,
+    created  DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS bonus_log (
+    account_id BIGINT UNSIGNED NOT NULL,
+    bonus_key  VARCHAR(32) NOT NULL,
+    amount     INT NOT NULL,
+    claimed    DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY (account_id, bonus_key),          -- 같은 보너스는 한 번만 기록된다(멱등성)
+    FOREIGN KEY (account_id) REFERENCES account(id)
+) ENGINE=InnoDB;
+
+CREATE TABLE IF NOT EXISTS game_result (
+    result_id  CHAR(36) PRIMARY KEY,              -- 요청 식별자(UUID). 같은 결과를 두 번 저장하지 않는다
+    room       VARCHAR(32) NOT NULL,
+    account_id BIGINT UNSIGNED NOT NULL,
+    score      INT NOT NULL,
+    saved      DATETIME NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+-- 보너스 지급: 기록과 지급이 함께 성공하거나 함께 취소되어야 한다
+START TRANSACTION;
+INSERT INTO bonus_log (account_id, bonus_key, amount) VALUES (1, 'welcome', 100);   -- 두 번째 실행은 오류 1062
+UPDATE account SET gold = gold + 100 WHERE id = 1;
+COMMIT;
+```
+
+**[확인할 것]** 계정 한 줄을 넣고 같은 INSERT를 두 번 실행하여 두 번째가 오류 1062(중복 키)로 거부되는지 확인한다. UPDATE 전에 ROLLBACK을 실행하면 bonus_log와 gold가 모두 원래대로인지 확인한다. 두 개의 mysql 창에서 같은 트랜잭션을 동시에 실행하여 한쪽만 성공하는지 확인한다.
+
+**[흔한 오류]** 트랜잭션을 지원하지 않는 저장 엔진을 쓰는 경우, utf8(3바이트)로 만들어 이모지 이름이 깨지는 경우, 중복 방지를 서버 코드의 조회 후 삽입으로만 처리하여 동시 요청에서 뚫리는 경우.
+
+실습 2 — C++ DB 계층과 DbShell: 가입, 로그인, 보너스 지급을 함수로 만들고 콘솔 명령으로 시험한다. 비밀번호는 계정별 salt와 PBKDF2로 해시하여 저장한다. 사용자 입력이 들어가는 문자열은 mysql_real_escape_string으로 처리한다(실서비스에서는 준비된 구문(prepared statement)을 사용한다). 보너스 지급은 실습 1의 트랜잭션을 그대로 따르며, 중복 키 오류(1062)를 이미 받은 보너스로 구분한다.
+
+```cpp
+// Db.h — MySQL C API. 모든 호출은 블로킹이며, 한 객체는 한 스레드에서만 쓴다.
+#pragma once
+#include <mysql.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <string>
+#include <vector>
+
+class Db
+{
+public:
+    bool Open(const char* host, const char* user, const char* pw, const char* db)
+    {
+        m_ = mysql_init(nullptr);
+        if (!mysql_real_connect(m_, host, user, pw, db, 3306, nullptr, 0)) return false;
+        mysql_set_character_set(m_, "utf8mb4");
+        return true;                                            // 연결이 끊기면 다시 Open한다
+    }
+    bool Register(const std::string& login, const std::string& pw)
+    {
+        unsigned char salt[16], hash[32];
+        RAND_bytes(salt, sizeof salt);
+        Hash(pw, salt, hash);
+        std::string q = "INSERT INTO account (login, pw_hash, salt) VALUES ('" + Esc(login) + "','" + Hex(hash, 32) + "','" + Hex(salt, 16) + "')";
+        return mysql_query(m_, q.c_str()) == 0;                 // 이미 있는 login이면 실패한다(UNIQUE)
+    }
+    bool Login(const std::string& login, const std::string& pw)
+    {
+        auto row = One("SELECT pw_hash, salt FROM account WHERE login='" + Esc(login) + "'", 2);
+        if (row.empty()) return false;
+        unsigned char salt[16], hash[32];
+        FromHex(row[1], salt, 16);                              // 저장된 salt로 다시 계산해 비교한다
+        Hash(pw, salt, hash);
+        return row[0] == Hex(hash, 32);
+    }
+    std::string ClaimBonus(const std::string& login, const std::string& key)
+    {
+        const int amount = 100;
+        auto row = One("SELECT id FROM account WHERE login='" + Esc(login) + "'", 1);
+        if (row.empty()) return "error";
+        const std::string id = row[0];
+        mysql_query(m_, "START TRANSACTION");
+        std::string q1 = "INSERT INTO bonus_log (account_id, bonus_key, amount) VALUES (" + id + ",'" + Esc(key) + "'," + std::to_string(amount) + ")";
+        if (mysql_query(m_, q1.c_str()) != 0)
+        {
+            unsigned err = mysql_errno(m_);
+            mysql_query(m_, "ROLLBACK");
+            return err == 1062 ? "already" : "error";            // 1062: 중복 키 = 이미 받은 보너스
+        }
+        std::string q2 = "UPDATE account SET gold = gold + " + std::to_string(amount) + " WHERE id=" + id;
+        if (mysql_query(m_, q2.c_str()) != 0) { mysql_query(m_, "ROLLBACK"); return "error"; }
+        mysql_query(m_, "COMMIT");
+        return "ok:" + std::to_string(amount);
+    }
+    bool SaveResult(const std::string& resultId, const std::string& room, const std::string& login, int score)
+    {
+        std::string q = "INSERT IGNORE INTO game_result (result_id, room, account_id, score) SELECT '" + Esc(resultId) + "','" + Esc(room)
+                      + "', id, " + std::to_string(score) + " FROM account WHERE login='" + Esc(login) + "'";
+        return mysql_query(m_, q.c_str()) == 0 && mysql_affected_rows(m_) == 1;   // 이미 저장된 결과면 false
+    }
+    void Slow() { mysql_query(m_, "SELECT SLEEP(3)"); }          // 실습 5의 시험용
+
+private:
+    MYSQL* m_ = nullptr;
+    std::string Esc(const std::string& s)
+    {
+        std::string o(s.size() * 2 + 1, '\0');
+        unsigned long n = mysql_real_escape_string(m_, &o[0], s.c_str(), (unsigned long)s.size());
+        o.resize(n);
+        return o;
+    }
+    std::vector<std::string> One(const std::string& sql, int cols)    // 한 행만 읽는다. 없으면 빈 벡터
+    {
+        std::vector<std::string> r;
+        if (mysql_query(m_, sql.c_str()) != 0) return r;
+        MYSQL_RES* res = mysql_store_result(m_);
+        if (!res) return r;
+        if (MYSQL_ROW row = mysql_fetch_row(res))
+            for (int i = 0; i < cols; ++i) r.push_back(row[i] ? row[i] : "");
+        mysql_free_result(res);
+        return r;
+    }
+    static void Hash(const std::string& pw, const unsigned char* salt, unsigned char* out)
+    {
+        PKCS5_PBKDF2_HMAC(pw.c_str(), (int)pw.size(), salt, 16, 100000, EVP_sha256(), 32, out);
+    }
+    static std::string Hex(const unsigned char* d, int n)
+    {
+        static const char* t = "0123456789abcdef";
+        std::string s;
+        for (int i = 0; i < n; ++i) { s += t[d[i] >> 4]; s += t[d[i] & 15]; }
+        return s;
+    }
+    static void FromHex(const std::string& s, unsigned char* out, int n)
+    {
+        for (int i = 0; i < n; ++i) out[i] = (unsigned char)std::stoi(s.substr(i * 2, 2), nullptr, 16);
+    }
+};
+
+// DbShell.cpp — 콘솔 명령이 GUI의 버튼 역할을 한다
+#include <iostream>
+#include "Db.h"
+int main()
+{
+    Db db;
+    if (!db.Open("127.0.0.1", "game", "gamepw", "gamedb")) { std::cout << "DB 연결 실패\n"; return 1; }
+    std::string cmd, a, b, c;
+    int n;
+    while (std::cin >> cmd)
+    {
+        if      (cmd == "/register") { std::cin >> a >> b; std::cout << (db.Register(a, b) ? "ok" : "fail") << "\n"; }
+        else if (cmd == "/login")    { std::cin >> a >> b; std::cout << (db.Login(a, b) ? "ok" : "fail") << "\n"; }
+        else if (cmd == "/bonus")    { std::cin >> a;      std::cout << db.ClaimBonus(a, "welcome") << "\n"; }
+        else if (cmd == "/result")   { std::cin >> a >> b >> c >> n; std::cout << (db.SaveResult(a, b, c, n) ? "saved" : "duplicate") << "\n"; }   // 결과ID 방 계정 점수
+        else if (cmd == "/quit") break;
+    }
+}
+```
+
+**[확인할 것]** /register 철수 pw1 → ok, 같은 이름으로 다시 → fail. /login 철수 pw1 → ok, 틀린 비밀번호 → fail. mysql에서 account를 조회하여 pw_hash에 평문이 없는지 확인한다. /bonus 철수를 두 번 실행하여 ok:100, already 순서로 나오고 gold가 한 번만 늘었는지 확인한다. 따옴표가 섞인 이름으로 로그인을 시도해도(예: x'or'1'='1) 로그인이 성공하지 않는지 확인한다.
+
+**[흔한 오류]** 비밀번호를 평문 또는 salt 없는 해시로 저장하는 경우, 입력 문자열을 escape하지 않고 SQL에 이어 붙이는 경우(SQL 주입), 오류 번호를 확인하지 않고 모든 실패를 중복으로 처리하는 경우, 트랜잭션 없이 INSERT와 UPDATE를 따로 실행하는 경우.
+
+실습 3 — 결과 저장의 중복 방지: 게임 결과를 저장하는 요청은 네트워크 재전송이나 서버 재시도로 두 번 도착할 수 있다. 서버가 결과마다 식별자(UUID)를 만들어 함께 저장하고, 같은 식별자는 한 번만 저장되게 한다. 이 요청 식별자 방식이 멱등성(같은 요청을 여러 번 처리해도 결과가 같음)을 확보하는 기본 방법이다.
+
+**[확인할 것]** /result 8f3a-0001 room1 철수 50 → saved, 같은 명령을 다시 → duplicate. 다른 결과ID로 다시 저장하면 saved가 되며, game_result에 한 번만 기록되었는지 SELECT로 확인한다. 두 개의 DbShell에서 같은 명령을 동시에 실행해도 한쪽만 saved인지 확인한다.
+
+**[흔한 오류]** 결과ID를 클라이언트가 임의로 정하게 하는 경우(서버가 생성하여 사용), 점수 누적(랭킹 반영) 같은 후속 작업을 저장 성공 여부와 관계없이 실행하는 경우(saved일 때만 실행한다).
+
+실습 4 — Redis 캐시와 랭킹: 랭킹과 로그인 세션 같은 빠른 조회 데이터를 Redis에 둔다. 랭킹은 Sorted Set(ZINCRBY, ZREVRANGE), 세션은 만료(EX)를 가진 키로 저장한다. Redis는 캐시이고 원본은 RDBMS이므로, Redis의 데이터가 사라져도 game_result에서 다시 계산할 수 있어야 한다.
+
+```cpp
+// Cache.h — hiredis
+#pragma once
+#include <hiredis/hiredis.h>
+#include <cstdarg>
+#include <string>
+#include <vector>
+
+class Cache
+{
+public:
+    bool Open(const char* host, int port) { c_ = redisConnect(host, port); return c_ && !c_->err; }
+    void AddScore(const std::string& login, int score) { Run("ZINCRBY rank %d %s", score, login.c_str()); }
+    std::vector<std::string> Top(int n)
+    {
+        std::vector<std::string> r;
+        redisReply* rep = (redisReply*)redisCommand(c_, "ZREVRANGE rank 0 %d WITHSCORES", n - 1);
+        if (rep && rep->type == REDIS_REPLY_ARRAY)
+            for (size_t i = 0; i + 1 < rep->elements; i += 2)
+                r.push_back(std::string(rep->element[i]->str) + " " + rep->element[i + 1]->str);
+        if (rep) freeReplyObject(rep);
+        return r;
+    }
+    void SetSession(const std::string& login, const std::string& token) { Run("SET session:%s %s EX 3600", login.c_str(), token.c_str()); }
+private:
+    redisContext* c_ = nullptr;
+    void Run(const char* fmt, ...)
+    {
+        va_list ap; va_start(ap, fmt);
+        redisReply* r = (redisReply*)redisvCommand(c_, fmt, ap);
+        va_end(ap);
+        if (r) freeReplyObject(r);
+    }
+};
+
+// DbShell에 명령을 추가한다
+//   /score 철수 50  →  if (db.SaveResult(newUuid, "room1", "철수", 50)) cache.AddScore("철수", 50);
+//   /rank           →  for (auto& line : cache.Top(10)) std::cout << line << "\n";
+// Redis가 비었을 때 원본에서 다시 만든다
+//   SELECT a.login, SUM(r.score) FROM game_result r JOIN account a ON a.id = r.account_id GROUP BY a.login ORDER BY 2 DESC LIMIT 10;
+```
+
+**[확인할 것]** 서로 다른 계정에 점수를 넣고 /rank의 순서가 점수순인지, 같은 결과ID를 다시 저장하려 할 때 랭킹 점수가 늘지 않는지 확인한다. redis-cli에서 TTL session:철수로 만료가 설정되었는지 확인하고, FLUSHALL로 Redis를 비운 뒤 위 SELECT 결과로 랭킹을 복구해 본다.
+
+**[흔한 오류]** 랭킹 갱신을 저장 성공 여부와 무관하게 실행하여 중복 점수가 쌓이는 경우, Redis 데이터를 유일한 원본으로 두는 경우, 만료 없이 세션 키가 계속 쌓이는 경우, 명령 실행 후 redisReply를 해제하지 않는 경우.
+
+실습 5 — DB Worker 스레드: DB 호출은 블로킹이므로 네트워크 처리 스레드에서 직접 호출하면 DB가 느릴 때 모든 접속자의 채팅이 멈춘다. DB 호출 전용 스레드를 두고 요청을 큐로 전달하며, DB 연결은 이 스레드만 사용한다(한 MYSQL 연결을 여러 스레드가 동시에 쓰지 않는다). 6장 실습 5에서는 결과를 논리 스레드로 되돌리는 방식으로 이 클래스를 사용한다.
+
+```cpp
+// DbWorker.h
+#pragma once
+#include <condition_variable>
+#include <deque>
+#include <functional>
+#include <mutex>
+#include <thread>
+
+class DbWorker
+{
+public:
+    DbWorker() : th_([this] { Loop(); }) {}
+    ~DbWorker()
+    {
+        { std::lock_guard<std::mutex> g(m_); stop_ = true; }
+        cv_.notify_one();
+        th_.join();
+    }
+    void Post(std::function<void()> job)
+    {
+        { std::lock_guard<std::mutex> g(m_); q_.push_back(std::move(job)); }
+        cv_.notify_one();
+    }
+private:
+    void Loop()
+    {
+        for (;;)
+        {
+            std::function<void()> job;
+            {
+                std::unique_lock<std::mutex> lk(m_);
+                cv_.wait(lk, [this] { return stop_ || !q_.empty(); });
+                if (q_.empty()) return;                 // 종료 요청이고 남은 작업이 없다
+                job = std::move(q_.front());
+                q_.pop_front();
+            }
+            job();                                      // 잠금 밖에서 실행한다
+        }
+    }
+    std::mutex m_;
+    std::condition_variable cv_;
+    std::deque<std::function<void()>> q_;
+    bool stop_ = false;
+    std::thread th_;                                    // 마지막에 선언하여 위의 멤버가 먼저 초기화되게 한다
+};
+
+// DbShell에 추가: /slow 는 DB 스레드에서 3초 걸리고, /ping 은 즉시 응답해야 한다
+DbWorker worker;
+//   if (cmd == "/slow") worker.Post([&] { db.Slow(); std::cout << "slow done\n"; });
+//   if (cmd == "/ping") std::cout << "pong\n";
+```
+
+**[확인할 것]** /slow 직후 /ping을 입력했을 때 3초를 기다리지 않고 pong이 바로 나오는지 확인한다(DB가 막혀도 입력을 받는 스레드는 막히지 않는다). /slow를 여러 번 입력하면 작업이 큐에 쌓여 순서대로 처리되는 것을 확인하고, 큐 길이에 상한을 두지 않았을 때 어떤 문제가 생기는지 설명한다.
+
+**[흔한 오류]** 여러 스레드가 같은 MYSQL 연결을 쓰는 경우, 작업 람다가 지역 변수를 참조로 캡처한 채 지역 변수가 먼저 사라지는 경우, DB 결과를 DB 스레드에서 바로 게임 자료구조에 적용하는 경우(결과는 논리 스레드로 되돌려서 적용한다).
+
+## 5.8 게임 데이터의 모델링
+
+데이터베이스 설계는 "무엇을 저장하는가"보다 "어떻게 읽고 쓰는가"에서 출발한다. 게임 데이터는 성격이 서로 달라서 한 가지 저장소로 모두 처리하기 어렵다.
+
+### 5.8.1 게임 데이터의 분류
+
+- 계정과 인증: 아이디, 비밀번호 해시, 가입일. 정확성이 최우선이고 쓰기는 드물다. RDBMS가 적합하다.
+- 캐릭터와 인벤토리: 레벨, 재화, 아이템. 로그인 시 읽고 플레이 중 가끔 쓴다. 재화와 아이템은 정확성이 중요하다. RDBMS 또는 문서형 DB.
+- 실시간 상태: 접속 세션, 방 목록, 현재 위치. 자주 바뀌고 잃어도 복구가 가능하다. 메모리(Redis 등)에 둔다.
+- 랭킹: 점수 갱신이 잦고 상위 N명 조회가 많다. Redis의 정렬 집합이 적합하다.
+- 로그와 통계: 쓰기가 매우 많고 읽기는 분석할 때뿐이다. 추가 전용 저장소나 로그 시스템에 쌓는다.
+
+### 5.8.2 테이블 설계
+
+관계형 설계의 기본은 한 사실을 한 곳에 두는 정규화이다. 정규화하면 갱신 이상이 줄어들지만 조회 시 JOIN이 늘어난다. 읽기 성능이 중요한 곳은 일부러 비정규화하되, 어느 쪽이 원본인지 명확히 한다.
+
+```sql
+CREATE TABLE account (
+  account_id   BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  login_name   VARCHAR(32)  NOT NULL UNIQUE,
+  pw_salt      VARBINARY(16) NOT NULL,
+  pw_hash      VARBINARY(32) NOT NULL,
+  created_at   DATETIME     NOT NULL DEFAULT CURRENT_TIMESTAMP
+) ENGINE=InnoDB;
+
+CREATE TABLE inventory (
+  account_id   BIGINT UNSIGNED NOT NULL,
+  item_id      INT UNSIGNED    NOT NULL,
+  amount       INT UNSIGNED    NOT NULL,
+  PRIMARY KEY (account_id, item_id),
+  FOREIGN KEY (account_id) REFERENCES account(account_id)
+) ENGINE=InnoDB;
+```
+
+- 기본 키는 짧고 변하지 않는 값으로 정한다. 복합 기본 키(account_id, item_id)는 "한 계정의 아이템 전체"를 읽는 조회에 유리하다.
+- 이름처럼 바뀔 수 있는 값을 기본 키로 쓰지 않는다.
+- 문자열 길이, 정수 크기, NOT NULL 같은 제약을 스키마에 둔다. 잘못된 데이터가 들어오지 못하게 하는 마지막 방어선이다.
+
+### 5.8.3 인덱스
+
+인덱스는 책의 색인과 같다. 인덱스가 없으면 조건에 맞는 행을 찾으려고 테이블 전체를 훑는다(풀 스캔). 대부분의 RDBMS는 B-Tree 인덱스를 쓰며 값을 정렬된 상태로 유지해 조회 시간이 데이터 양의 로그에 비례한다.
+
+- 조회 조건과 정렬에 쓰이는 열에 만든다. 대신 쓰기 때마다 인덱스도 갱신되므로 불필요한 인덱스는 쓰기를 느리게 하고 저장 공간을 쓴다.
+- 복합 인덱스는 열 순서가 중요하다. (a, b) 인덱스는 a로 찾는 조회에는 쓰이지만 b만으로 찾는 조회에는 쓰이지 못한다.
+- 조건 열에 함수를 씌우면(예: DATE(created_at)=...) 인덱스를 못 쓰는 경우가 많다.
+- 실행 계획(EXPLAIN)으로 인덱스를 쓰는지 확인한다. 느린 쿼리는 추측하지 않고 실행 계획과 측정으로 원인을 찾는다.
+
+자주 하는 실수는 SELECT *로 필요 없는 열까지 읽는 것, 반복문 안에서 쿼리를 한 건씩 실행하는 것(N+1 문제), 인덱스 없는 열로 조회하는 것, 트랜잭션을 길게 열어 두는 것이다.
+
+## 5.9 트랜잭션과 동시성 제어
+
+### 5.9.1 ACID
+
+트랜잭션은 여러 작업을 하나로 묶는 단위이다. 원자성(Atomicity)은 전부 성공하거나 전부 취소되는 것, 일관성(Consistency)은 제약을 항상 만족하는 것, 격리성(Isolation)은 동시에 실행되는 트랜잭션이 서로 간섭하지 않는 것, 지속성(Durability)은 커밋된 결과가 장애 후에도 남는 것이다.
+
+게임에서 아이템 거래는 두 계정의 재화 이동과 아이템 이동이 한꺼번에 일어나야 하므로 대표적인 트랜잭션 대상이다. 서버가 중간에 죽어도 돈만 빠지고 아이템이 안 들어오는 일이 없어야 한다.
+
+```sql
+START TRANSACTION;
+UPDATE wallet SET gold = gold - 500 WHERE account_id = 1 AND gold >= 500;
+-- 영향받은 행이 0이면 잔액 부족: ROLLBACK 후 실패 응답
+UPDATE wallet SET gold = gold + 500 WHERE account_id = 2;
+INSERT INTO trade_log(from_id, to_id, gold) VALUES (1, 2, 500);
+COMMIT;
+```
+
+조건(gold >= 500)을 UPDATE 문 안에 넣으면 조회와 갱신 사이에 다른 요청이 끼어드는 문제를 없애 준다. 먼저 SELECT로 잔액을 읽고 서버 코드에서 비교한 뒤 UPDATE하는 방식은 두 요청이 동시에 오면 잔액이 음수가 될 수 있다.
+
+### 5.9.2 격리 수준과 이상 현상
+
+격리 수준이 낮을수록 빠르지만 아래의 이상 현상이 생길 수 있다.
+
+- Dirty Read: 커밋되지 않은 다른 트랜잭션의 값을 읽는다.
+- Non-repeatable Read: 같은 행을 두 번 읽었는데 그 사이 다른 트랜잭션이 커밋해 값이 다르다.
+- Phantom Read: 같은 조건으로 두 번 조회했는데 행의 개수가 다르다.
+
+표준 격리 수준은 READ UNCOMMITTED, READ COMMITTED, REPEATABLE READ, SERIALIZABLE이며 아래로 갈수록 강하다. MySQL InnoDB의 기본은 REPEATABLE READ이다. 격리 수준의 세부 동작은 제품마다 다르므로 사용하는 DB의 문서를 확인한다.
+
+### 5.9.3 락, 데드락, 낙관적 동시성
+
+- 행 잠금: SELECT ... FOR UPDATE는 읽은 행을 커밋할 때까지 다른 트랜잭션이 바꾸지 못하게 잠근다. 잠금 범위와 시간은 짧을수록 좋다.
+- 데드락: 두 트랜잭션이 서로 상대가 가진 잠금을 기다리는 상태이다. DB가 한쪽을 강제로 취소하므로 코드는 해당 오류(MySQL 오류 1213)를 받으면 트랜잭션을 처음부터 다시 시도한다. 여러 행을 갱신할 때 항상 같은 순서로(예: 계정 번호 오름차순) 잠그면 데드락이 줄어든다.
+- 낙관적 동시성: 행에 version 열을 두고 UPDATE ... WHERE id=? AND version=?로 갱신한다. 영향받은 행이 0이면 다른 요청이 먼저 바꾼 것이므로 다시 읽어서 재시도한다. 충돌이 드문 데이터에 알맞다.
+
+### 5.9.4 멱등성과 중복 처리
+
+네트워크에서는 같은 요청이 두 번 도착할 수 있다(재시도, 재전송). 아이템 지급이 두 번 처리되면 안 되므로 요청마다 고유한 ID(요청 ID, 영수증 번호)를 만들고, 그 ID를 기본 키나 유일 키로 가진 테이블에 먼저 기록한다. 이미 있으면 중복 키 오류(MySQL 1062)가 나므로 지급하지 않고 이전 결과를 돌려준다. 5.7절 실습의 구조이다.
+
+## 5.10 캐시와 Redis
+
+### 5.10.1 왜 캐시가 필요한가
+
+디스크 기반 DB는 한 번의 질의에 수 ms가 걸리지만 메모리 저장소는 수십~수백 µs 수준이다. 접속자가 많아지면 같은 데이터를 반복해서 읽는 요청이 DB를 압도한다. 자주 읽고 덜 바뀌는 데이터를 메모리에 두면 DB 부하가 크게 줄어든다.
+
+### 5.10.2 캐시 패턴
+
+- Cache-Aside: 읽을 때 캐시를 먼저 보고, 없으면 DB에서 읽어 캐시에 채운다. 쓸 때는 DB를 갱신하고 캐시 항목을 지운다. 가장 흔하고 이해하기 쉽다.
+- Write-Through: 쓸 때 캐시와 DB를 함께 갱신한다. 읽기는 항상 최신이지만 쓰기가 느리다.
+- Write-Behind: 캐시에만 먼저 쓰고 DB에는 나중에 모아서 쓴다. 쓰기가 빠르지만 캐시가 죽으면 최근 변경이 사라질 수 있다.
+
+캐시의 가장 큰 어려움은 일관성이다. DB는 바뀌었는데 캐시가 낡은 값을 가지고 있을 수 있다. TTL(만료 시간)을 두어 오래된 값이 자연스럽게 사라지게 하고, 갱신할 때 캐시를 지우는 규칙을 일관되게 적용한다. 인기 항목이 한꺼번에 만료되어 DB에 요청이 몰리는 현상(캐시 스탬피드)은 만료 시각에 무작위 편차를 주어 완화한다.
+
+### 5.10.3 Redis의 자료구조와 용도
+
+- String: 세션 토큰, 카운터. SET key value EX 초 로 만료 시간을 함께 지정한다.
+- Hash: 객체의 필드 모음. 플레이어 한 명의 임시 상태.
+- Sorted Set: 점수로 정렬되는 집합. ZINCRBY로 점수를 올리고 ZREVRANGE로 상위 N명을 읽는다. 랭킹의 표준 구현이다.
+- List/Stream: 큐. 작업 대기열이나 이벤트 기록.
+- Pub/Sub: 가벼운 알림 전달. 구독자가 없으면 메시지가 사라지므로 중요한 이벤트에는 쓰지 않는다.
+
+Redis는 기본적으로 단일 스레드로 명령을 하나씩 처리하므로 각 명령은 원자적이다. 여러 명령을 묶어 원자적으로 실행하려면 트랜잭션(MULTI/EXEC)이나 스크립트를 쓴다. 영속성은 스냅샷(RDB)과 쓰기 기록(AOF)으로 선택하며, 캐시로만 쓰면 잃어도 되지만 유일한 원본으로 쓰면 안 된다.
+
+Redis로 분산 잠금을 만들 때는 SET key token NX PX 시간으로 잠금을 얻고, 해제 시 자신의 token인지 확인한다. 잠금 시간이 지나 다른 프로세스가 같은 잠금을 얻을 수 있으므로 중요한 정합성은 잠금에 의존하지 말고 DB의 제약과 트랜잭션으로 보장한다.
+
+## 5.11 NoSQL과 선택 기준
+
+NoSQL은 "관계형이 아닌" 저장소의 통칭이며 종류가 다양하다.
+
+- 키-값(Redis, DynamoDB): 키로 값을 읽고 쓴다. 가장 빠르고 단순하며 복잡한 조건 검색이 어렵다.
+- 문서형(MongoDB): JSON과 비슷한 문서를 저장한다. 스키마가 유연해서 캐릭터처럼 필드가 자주 바뀌는 데이터에 편리하다. 하나의 문서 안에서는 원자적이지만 여러 문서에 걸친 트랜잭션은 제한적이거나 비용이 크다.
+- 와이드 컬럼(Cassandra): 쓰기가 많고 수평 확장이 필요한 데이터에 맞다. 질의 방식을 미리 정해 테이블을 설계한다.
+- 그래프: 친구 관계처럼 관계 탐색이 중심인 데이터.
+
+선택 질문: (1) 정확성이 얼마나 중요한가? 돈과 아이템은 트랜잭션이 필요하다. (2) 읽기와 쓰기 비율은? (3) 조회 방식이 정해져 있는가, 임의 조건 검색이 필요한가? (4) 데이터 크기와 증가 속도는? (5) 팀이 운영할 수 있는 기술인가? 새로운 기술이 좋아 보여도 팀이 운영할 수 없으면 장애 때 복구하지 못한다. 처음에는 RDBMS 하나와 Redis로 시작하고 필요가 확인된 곳만 다른 저장소를 추가하는 것이 안전하다.
+
+## 5.12 확장성과 분산 환경의 일관성
+
+### 5.12.1 복제와 읽기 분리
+
+복제(replication)는 기본 DB(primary)의 변경을 복사본(replica)에 전달해 같은 데이터를 여러 곳에 두는 방식이다. 읽기를 복사본으로 분산하고, 기본 DB가 죽으면 복사본이 이어받아 가용성을 높인다. 복제에는 지연이 있어서 방금 쓴 값이 복사본에서는 아직 안 보일 수 있다. 쓴 직후에 읽어야 하는 경우(결제 직후 잔액 조회 등)는 기본 DB에서 읽는다.
+
+### 5.12.2 샤딩
+
+데이터가 한 대의 DB에 들어가지 않거나 쓰기가 한 대의 한계를 넘으면 데이터를 여러 DB에 나누어 저장한다(샤딩).
+
+- 범위 기반: 계정 번호 1~100만은 샤드 1, 그 다음은 샤드 2. 구현이 쉽지만 최근 계정이 한 샤드에 몰릴 수 있다.
+- 해시 기반: 계정 번호의 해시를 샤드 수로 나눈 나머지로 정한다. 고르게 분산되지만 샤드를 늘리면 대부분의 데이터가 이동한다. 일관 해싱이나 가상 샤드(작은 조각을 많이 만들어 샤드에 배정)로 이동량을 줄인다.
+- 디렉터리 기반: 어느 계정이 어느 샤드에 있는지 별도 표에 기록한다. 유연하지만 그 표가 병목이자 단일 장애 지점이 된다.
+
+샤드 키는 대부분의 요청이 한 샤드 안에서 끝나도록 정한다. 게임에서는 계정 번호가 흔하다. 두 계정에 걸친 거래는 서로 다른 샤드를 건드리게 되어 단일 트랜잭션으로 처리할 수 없으므로 다음의 분산 일관성 문제가 생긴다.
+
+### 5.12.3 CAP과 최종 일관성
+
+CAP 정리는 네트워크가 나뉘는 상황(Partition)에서 일관성(Consistency)과 가용성(Availability)을 둘 다 완전히 지킬 수 없다는 이론이다. 분산 시스템은 장애 때 "일관성을 지키려고 요청을 거부"하거나 "가용성을 지키려고 낡은 값을 허용"하는 쪽을 선택한다. 최종 일관성(eventual consistency)은 갱신이 멈추면 결국 모든 복사본이 같은 값이 된다는 약한 보장이다. 랭킹이나 친구의 접속 상태에는 충분하지만, 재화와 아이템에는 부족하다.
+
+### 5.12.4 분산 트랜잭션: 2PC와 Saga
+
+- 2단계 커밋(2PC): 모든 참여자에게 준비 가능 여부를 묻고(1단계), 모두 가능하면 커밋을 지시한다(2단계). 일관성은 강하지만 조정자가 죽으면 참여자가 잠금을 쥔 채 기다리고, 느리다.
+- Saga: 긴 작업을 여러 로컬 트랜잭션으로 쪼개고, 실패하면 앞 단계를 되돌리는 보상 작업을 실행한다. 예를 들어 A의 재화 차감, B의 아이템 지급 순서로 진행하다 두 번째가 실패하면 A의 재화를 되돌려 준다. 중간 상태가 외부에 보일 수 있으므로 "처리 중" 상태를 기록하고 각 단계를 멱등하게 만든다.
+
+이 교재는 Saga의 아이디어(상태 기록, 멱등한 단계, 보상)를 설명 수준으로 다루고, 실습은 단일 DB의 트랜잭션과 멱등 키까지만 구현한다.
+
+## 5.13 백업, 마이그레이션, 보안
+
+- 백업: 정기 전체 백업과 변경분(증분) 백업, 그리고 시점 복구(Point-in-Time Recovery)를 위한 바이너리 로그 보관. 백업은 복구해 보아야만 백업이다. 복구 시험을 정기적으로 한다.
+- 스키마 변경: 운영 중인 큰 테이블에 열을 추가하면 오래 잠길 수 있다. 서비스를 멈추지 않는 방법(새 열 추가 후 점진 채움, 온라인 DDL 도구)을 미리 검토하고, 코드는 이전/새 스키마를 모두 견디도록 먼저 배포한다.
+- SQL 인젝션 방지: 사용자 입력을 문자열로 이어 붙여 SQL을 만들지 않고 준비된 문장(prepared statement)에 매개변수로 전달한다. 5.7절의 이스케이프 방법은 학습용 최소 방어이며 실서비스는 준비된 문장을 쓴다.
+- 최소 권한: 게임 서버용 DB 계정에는 필요한 테이블에 필요한 권한만 준다. 계정 정보는 소스 코드가 아니라 설정 파일이나 환경 변수에 두고 저장소에 올리지 않는다.
+- 개인정보: 수집 항목을 최소화하고, 비밀번호는 솔트와 해시로 저장한다. 관련 법규는 서비스 지역에 따라 다르므로 서비스 전에 확인한다.
+
+## 5.14 서버와 DB 연동 설계
+
+### 5.14.1 언제 읽고 언제 저장하는가
+
+- 로그인 시 읽기: DB에서 캐릭터를 읽어 서버 메모리에 올린다. 이후 플레이 중에는 메모리의 값을 쓴다.
+- 저장 시점: 중요 이벤트(결제, 거래, 레벨 업)는 즉시, 일반 상태는 주기적(예: 수 분마다)으로, 로그아웃과 서버 종료 때 한 번 더 저장한다. 저장 주기가 길수록 DB 부하는 작지만 서버가 갑자기 죽을 때 잃는 양이 커진다. 잃어도 되는 범위를 먼저 정하고 주기를 정한다.
+- 한 사람의 데이터를 두 서버가 동시에 들고 있지 않게 한다. 로그인 시 이전 접속을 끊고(중복 로그인 처리) 세션 소유 서버를 기록한다.
+
+### 5.14.2 DB 작업 스레드와 연결 풀
+
+1장에서 본 것처럼 DB 호출은 게임 루프에서 직접 하지 않는다. DB Worker 스레드(들)가 작업 큐에서 요청을 꺼내 실행하고 결과를 로직 스레드로 돌려보낸다. DB 연결은 만드는 비용이 크므로 연결을 미리 몇 개 만들어 두고 재사용하는 연결 풀을 쓰며, 연결 하나는 한 번에 한 스레드만 쓴다. 풀 크기는 DB가 감당할 동시 질의 수에 맞추고, 요청이 풀보다 많이 쌓이면 대기열 길이를 지표로 기록해 경보를 건다.
+
+```text
+[Logic thread] -- 요청(계정, 질의) --> [Job Queue] --> [DB Worker 1..N] --> MySQL
+[Logic thread] <-- 결과 큐 -------------------------------+
+```
+
+오류 처리는 일시 오류(연결 끊김, 데드락)와 영구 오류(제약 위반)를 구분한다. 일시 오류는 제한된 횟수로 재시도하고, 영구 오류는 사용자에게 알리고 기록한다. 재시도 가능한 요청은 5.9.4절의 멱등 키로 중복을 막아야 한다.
+
+## 5.15 5장 연습 문제
+
+1. 계정, 인벤토리, 랭킹, 접속 세션, 전투 로그 각각에 알맞은 저장소를 고르고 이유를 한 줄로 써라.
+2. 두 요청이 동시에 같은 계정의 재화 500을 차감하려 한다(잔액 600). SELECT 후 서버에서 비교하는 방식과 UPDATE ... WHERE gold >= 500 방식의 결과를 비교하라.
+3. (account_id, item_id) 복합 인덱스로 item_id만 조건으로 한 조회가 느린 이유를 설명하고 해결책을 제시하라.
+4. 아이템 지급 요청이 네트워크 재전송으로 두 번 도착했다. 중복 지급을 막는 방법을 테이블 구조와 함께 설명하라.
+5. Cache-Aside 방식에서 캐시와 DB가 어긋나는 상황 한 가지를 들고 완화 방법을 쓰라.
+6. 계정 번호 해시로 샤딩한 환경에서 두 계정 사이의 거래를 안전하게 처리하는 Saga 절차를 단계별로 쓰라.
+7. 서버가 갑자기 종료될 때 최근 5분 동안의 플레이 기록이 사라지는 것을 허용할 수 있는지 논하고, 허용할 수 없는 항목은 어떻게 저장할지 제안하라.
