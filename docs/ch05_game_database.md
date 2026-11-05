@@ -365,6 +365,28 @@ CREATE TABLE inventory (
 
 자주 하는 실수는 SELECT *로 필요 없는 열까지 읽는 것, 반복문 안에서 쿼리를 한 건씩 실행하는 것(N+1 문제), 인덱스 없는 열로 조회하는 것, 트랜잭션을 길게 열어 두는 것이다.
 
+### 5.8.4 ERD, 정규화, 반정규화
+
+테이블을 하나씩 만들기 전에 데이터 사이의 관계를 그림으로 먼저 그린다. 이 그림이 ERD(Entity-Relationship Diagram, 개체-관계 다이어그램)이다. 개체는 테이블, 속성은 열, 관계는 개체 사이의 연결이다. 관계는 한쪽의 한 행이 다른 쪽의 몇 행과 연결되는지로 나눈다. 1:1, 1:N(한 계정에 캐릭터 여러 개), N:M(학생과 과목처럼 양쪽이 모두 여러 개)이 있고, N:M 관계는 가운데에 연결 테이블을 두어 1:N 두 개로 푼다.
+
+```text
+account (1) ----- (N) player (N) ----- (1) guild
+   |
+   +----- (N) inventory (N) ----- (1) item_template
+   |
+   +----- (1) wallet
+```
+
+위 그림은 게임 데이터의 한 부분을 단순화한 예이다. 계정 하나에 캐릭터(player)가 여러 개 있을 수 있고, 캐릭터는 길드 하나에 속한다. 인벤토리는 계정과 아이템 템플릿(아이템의 종류와 능력치를 정의한 테이블) 사이의 N:M 관계를 푼 연결 테이블이고, 수량(amount)처럼 관계 자체에 붙는 속성을 가진다.
+
+정규화는 한 사실을 한 곳에만 두도록 테이블을 나누는 과정이다. 같은 사실이 여러 곳에 있으면 한 곳만 고쳤을 때 값이 어긋나는 갱신 이상이 생긴다. 게임 데이터로 세 단계를 본다.
+
+- 제1정규형: 한 열에는 값 하나만 둔다. player 테이블의 items 열에 "1001,1002,1003"처럼 여러 아이템을 쉼표로 넣으면 특정 아이템을 가진 사람을 찾을 수 없고 수량도 표현할 수 없다. 별도의 inventory 테이블로 나눈다.
+- 제2정규형: 복합 기본 키의 일부에만 종속된 열을 분리한다. inventory(account_id, item_id, item_name, amount)에서 item_name은 item_id에만 종속되므로 item_template으로 옮긴다. 그렇지 않으면 아이템 이름을 바꿀 때 모든 계정의 행을 고쳐야 한다.
+- 제3정규형: 기본 키가 아닌 열에 종속된 열을 분리한다. player(player_id, name, job_id, job_name)에서 job_name은 job_id로 정해지므로 job 테이블로 옮긴다.
+
+반정규화는 성능을 위해 일부러 중복을 허용하는 것이다. 길드의 인원수를 매번 player 테이블에서 세지 않고 guild 테이블의 member_count 열에 저장해 두는 것이 예이다. 읽기는 빨라지지만 일관성을 지킬 책임이 코드로 넘어온다. 가입과 탈퇴 때 한 트랜잭션 안에서 member_count를 함께 고치고, 어긋날 수 있으니 주기적으로 다시 계산해 바로잡는다(5.16절의 배치 작업). 순서는 항상 정규화로 설계하고, 측정으로 병목을 확인한 뒤, 필요한 곳만 반정규화하는 것이다. 어느 쪽이 원본인지 명확히 해 두어야 어긋났을 때 무엇을 믿고 고칠지 알 수 있다.
+
 ## 5.9 트랜잭션과 동시성 제어
 
 ### 5.9.1 ACID
@@ -495,7 +517,243 @@ CAP 정리는 네트워크가 나뉘는 상황(Partition)에서 일관성(Consis
 
 오류 처리는 일시 오류(연결 끊김, 데드락)와 영구 오류(제약 위반)를 구분한다. 일시 오류는 제한된 횟수로 재시도하고, 영구 오류는 사용자에게 알리고 기록한다. 재시도 가능한 요청은 5.9.4절의 멱등 키로 중복을 막아야 한다.
 
-## 5.15 5장 연습 문제
+## 5.15 SQL 응용과 데이터베이스 내부 로직
+
+5.7절의 실습은 한 테이블에 넣고 읽는 SQL 위주였다. 서버가 실제로 쓰는 질의는 집계, 서브쿼리, 여러 테이블의 결합이 섞인다. 이 절의 질의는 5.8절의 account, inventory와 5.9절의 wallet(account_id, gold), trade_log(from_id, to_id, gold), 그리고 아래의 guild, player 테이블을 기준으로 한다.
+
+```sql
+CREATE TABLE guild (
+  guild_id     INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  name         VARCHAR(32) NOT NULL UNIQUE
+) ENGINE=InnoDB;
+
+CREATE TABLE player (
+  player_id    BIGINT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
+  account_id   BIGINT UNSIGNED NOT NULL,
+  name         VARCHAR(32) NOT NULL UNIQUE,
+  level        INT UNSIGNED NOT NULL DEFAULT 1,
+  guild_id     INT UNSIGNED NULL,
+  FOREIGN KEY (account_id) REFERENCES account(account_id),
+  FOREIGN KEY (guild_id)   REFERENCES guild(guild_id)
+) ENGINE=InnoDB;
+```
+
+**[검증 환경]** 이 절을 쓰는 환경에는 MySQL이 없었다. 표준 SQL 부분(집계, 서브쿼리, 집합 연산, 트리거 본문의 동작, 프로시저 안의 UPDATE 문장과 분기)은 SQLite에서 실행해 결과를 확인했다. MySQL에만 있는 문법(프로시저 선언과 `DELIMITER`, `DELETE ... ORDER BY ... LIMIT`, 슬로우 쿼리 설정)은 MySQL에서 실행하지 못했으니 사용하는 버전에서 확인한다.
+
+### 5.15.1 집계와 그룹
+
+COUNT, SUM, AVG, MAX, MIN은 여러 행을 하나의 값으로 묶는다. GROUP BY는 묶는 기준을, HAVING은 묶은 결과에 거는 조건을 지정한다. WHERE는 묶기 전의 행을 거르고 HAVING은 묶은 뒤의 결과를 거른다는 차이를 구분한다.
+
+```sql
+-- 길드별 인원과 평균 레벨 (5명 이상인 길드만)
+SELECT guild_id, COUNT(*) AS members, AVG(level) AS avg_level
+FROM player
+WHERE guild_id IS NOT NULL
+GROUP BY guild_id
+HAVING COUNT(*) >= 5
+ORDER BY avg_level DESC;
+```
+
+집계는 데이터가 많을수록 오래 걸린다. 접속자 수 통계나 랭킹처럼 자주 필요한 집계를 실시간 요청마다 계산하지 않고, 주기적으로 계산해 저장해 두거나(5.16절) Redis에 갱신하며 유지한다(5.10절).
+
+### 5.15.2 서브쿼리와 집합 연산
+
+서브쿼리는 질의 안에 들어 있는 질의이다. 하나의 값을 돌려주는 서브쿼리는 비교에, 여러 값을 돌려주는 서브쿼리는 IN과 EXISTS에 쓴다.
+
+```sql
+-- 평균보다 레벨이 높은 캐릭터
+SELECT name, level FROM player
+WHERE level > (SELECT AVG(level) FROM player);
+
+-- 아이템 1001을 가진 캐릭터 (IN과 EXISTS는 같은 결과를 낸다)
+SELECT name FROM player
+WHERE account_id IN (SELECT account_id FROM inventory WHERE item_id = 1001);
+
+SELECT name FROM player p
+WHERE EXISTS (SELECT 1 FROM inventory i WHERE i.account_id = p.account_id AND i.item_id = 1001);
+
+-- 길드가 없는 캐릭터 (LEFT JOIN으로 짝이 없는 행 찾기)
+SELECT p.name FROM player p
+LEFT JOIN guild g ON g.guild_id = p.guild_id
+WHERE g.guild_id IS NULL;
+```
+
+집합 연산은 두 질의의 결과를 합치거나 비교한다. UNION은 중복을 제거하고 합치며, UNION ALL은 중복을 그대로 둔다. 중복이 없다고 알고 있거나 중복이 있어도 되면 UNION ALL이 빠르다. 중복 제거를 위해 정렬이나 해시 작업이 필요하기 때문이다.
+
+```sql
+-- 거래에 한 번이라도 참여한 계정 (중복 제거)
+SELECT from_id AS account_id FROM trade_log
+UNION
+SELECT to_id FROM trade_log;
+```
+
+### 5.15.3 저장 프로시저, 함수, 트리거
+
+DBMS 안에 로직을 저장해 두는 방법이 있다.
+
+- 저장 프로시저: 이름을 붙여 DB에 저장한 일련의 SQL이다. 서버는 `CALL`로 호출한다.
+- 저장 함수: 값을 돌려주며 질의 안에서 쓸 수 있다.
+- 트리거: 테이블의 INSERT, UPDATE, DELETE가 일어나면 자동으로 실행된다.
+
+5.9절의 재화 이동을 프로시저로 만들면 다음과 같다(MySQL 문법). 5.9절의 문장에 세 가지를 더했다. 금액이 0 이하이거나 보내는 계정과 받는 계정이 같은 요청을 거절하고(음수 금액을 허용하면 받는 쪽의 재화를 빼앗는 요청이 된다), 받는 계정이 없으면 취소하고(없는데 빼기만 하고 끝나면 재화가 사라진다), 두 지갑을 계정 번호가 작은 쪽부터 잠근다(5.9.3절).
+
+```sql
+DELIMITER //
+CREATE PROCEDURE sp_transfer_gold(IN p_from BIGINT, IN p_to BIGINT, IN p_gold BIGINT, OUT p_result INT)
+BEGIN
+    DECLARE v_gold BIGINT;
+    DECLARE EXIT HANDLER FOR SQLEXCEPTION
+    BEGIN
+        ROLLBACK;
+        SET p_result = -1;                              -- 오류 (교착 상태로 취소된 경우도 여기로 온다)
+    END;
+    IF p_gold <= 0 OR p_from = p_to THEN
+        SET p_result = 2;                               -- 잘못된 요청
+    ELSE
+        START TRANSACTION;
+        -- 두 지갑을 계정 번호가 작은 쪽부터 잠근다. 값은 쓰지 않고 잠그기 위해 읽는다.
+        SELECT gold INTO v_gold FROM wallet WHERE account_id = LEAST(p_from, p_to) FOR UPDATE;
+        SELECT gold INTO v_gold FROM wallet WHERE account_id = GREATEST(p_from, p_to) FOR UPDATE;
+        UPDATE wallet SET gold = gold - p_gold WHERE account_id = p_from AND gold >= p_gold;
+        IF ROW_COUNT() = 0 THEN
+            ROLLBACK;
+            SET p_result = 1;                           -- 잔액 부족이거나 보내는 계정이 없다
+        ELSE
+            UPDATE wallet SET gold = gold + p_gold WHERE account_id = p_to;
+            IF ROW_COUNT() = 0 THEN
+                ROLLBACK;
+                SET p_result = 3;                       -- 받는 계정이 없다
+            ELSE
+                INSERT INTO trade_log(from_id, to_id, gold) VALUES (p_from, p_to, p_gold);
+                COMMIT;
+                SET p_result = 0;                       -- 성공
+            END IF;
+        END IF;
+    END IF;
+END //
+DELIMITER ;
+
+CALL sp_transfer_gold(1, 2, 500, @r);
+SELECT @r;
+```
+
+`DELIMITER //`는 mysql 클라이언트의 명령으로, 프로시저 본문 안의 세미콜론이 문장의 끝으로 해석되지 않도록 구분자를 바꾼다. 결과는 `p_result`로 돌려준다.
+
+- 0: 성공.
+- 1: 잔액이 부족하거나 보내는 계정이 없다.
+- 2: 잘못된 요청(금액이 0 이하이거나 같은 계정끼리의 이동).
+- 3: 받는 계정이 없다.
+- -1: 그 밖의 오류. 교착 상태로 취소된 경우도 여기에 온다.
+
+서버는 -1을 받으면 짧게 기다렸다가 제한된 횟수만 다시 시도할 수 있다(5.9.3절). 다만 이 프로시저는 같은 요청이 두 번 도착하면 두 번 처리한다. 네트워크 재전송으로 생기는 중복은 5.9.4절의 요청 ID로 따로 막아야 한다.
+
+트리거로 재화 변경 이력을 자동으로 남기는 예는 다음과 같다(MySQL 문법). 변경 이력을 담는 wallet_audit(account_id, old_gold, new_gold, changed_at) 테이블이 있다고 가정하고, changed_at의 기본값은 현재 시각이다.
+
+```sql
+DELIMITER //
+CREATE TRIGGER trg_wallet_audit AFTER UPDATE ON wallet
+FOR EACH ROW
+BEGIN
+    INSERT INTO wallet_audit(account_id, old_gold, new_gold) VALUES (OLD.account_id, OLD.gold, NEW.gold);
+END //
+DELIMITER ;
+```
+
+`OLD`는 바뀌기 전의 행이고 `NEW`는 바뀐 뒤의 행이다. 이 본문은 SQLite에서 `DELIMITER` 없이 `END;`로 닫아 실행했고, wallet을 고칠 때마다 wallet_audit에 한 줄이 쌓이는 것을 확인했다.
+
+DB 안에 로직을 두는 선택에는 장단점이 있다.
+
+- 장점: 여러 문장을 한 번의 호출로 실행해 네트워크 왕복이 줄어든다. 트랜잭션 경계가 DB 안에 있어 서버가 중간에 죽어도 일관성이 지켜진다. 애플리케이션 계정에 테이블 권한을 주지 않고 프로시저 실행 권한만 줄 수 있다.
+- 단점: 로직이 서버 코드와 DB 두 곳으로 갈라져 버전 관리, 배포, 디버깅, 시험이 어려워진다. 서버는 늘릴 수 있지만 DB는 늘리기 어려운데, 로직의 CPU 부하가 DB에 몰린다. DBMS마다 문법이 달라 옮기기 어렵다. 트리거는 호출하는 코드에 보이지 않는 숨은 동작이어서 원인을 추적하기 어렵고 대량 갱신을 느리게 한다.
+
+게임 업계에서도 팀마다 선택이 갈린다. 이 교재는 로직을 서버 코드에 두는 것을 기본으로 하고, 트랜잭션 경계가 중요한 소수의 처리와 감사 기록에만 프로시저나 트리거를 검토한다.
+
+### 5.15.4 느린 질의를 찾아 고치는 절차
+
+성능 문제는 추측하지 않고 측정으로 접근한다.
+
+1. 분석: MySQL의 슬로우 쿼리 로그를 켜서 기준 시간(long_query_time)보다 오래 걸린 질의를 모은다. `SET GLOBAL slow_query_log = 'ON'; SET GLOBAL long_query_time = 0.5;`처럼 설정한다. 모은 질의 중 가장 시간을 많이 쓰는 것부터 본다.
+2. 원인 확인: EXPLAIN(5.8.3절)으로 풀 스캔인지, 인덱스를 쓰는지, 읽는 행 수가 얼마인지 본다. 흔한 원인은 인덱스가 없거나 쓰이지 못하는 조건, 필요 이상으로 많은 행과 열을 읽는 것, 반복문 안의 질의(N+1 문제)이다.
+3. 개선: 인덱스를 추가하거나 조건을 고치고, 반복 질의를 JOIN이나 IN으로 한 번에 처리한다.
+4. 정량 평가: 개선 전후의 실행 시간과 읽은 행 수를 같은 데이터로 비교해서 기록한다. 개선했다는 느낌이 아니라 숫자로 확인한다. 인덱스를 추가하면 쓰기가 느려지므로 쓰기 성능도 함께 확인한다.
+
+## 5.16 배치 작업과 정기 처리
+
+사용자의 요청과 상관없이 정해진 시각이나 주기에 실행되는 작업을 배치 작업이라고 한다. 게임 서버에는 이런 작업이 많다.
+
+- 일일 초기화: 출석, 일일 퀘스트, 무료 횟수의 재설정.
+- 집계: 랭킹, 통계, 길드 인원수 같은 반정규화한 값의 재계산(5.8.4절).
+- 정리: 만료된 우편, 오래된 세션, 보관 기간이 지난 로그와 개인정보의 삭제(1.11절).
+- 보고: 일별 접속자와 매출 집계.
+
+### 5.16.1 어디에서 실행하는가
+
+- 서버 프로세스 안의 타이머: 구현이 단순하고 서버의 자료구조에 바로 접근한다. 서버가 여러 대이면 같은 작업이 중복 실행되고, 서버가 꺼져 있던 시간의 작업은 누락된다.
+- 별도의 배치 프로그램을 OS 스케줄러로 실행(Windows 작업 스케줄러, Linux cron): 서버와 분리되어 서버 장애의 영향이 적고 실행 기록이 남는다. 서버 메모리의 상태를 볼 수 없어 DB를 거쳐야 하고, 실행 환경을 따로 관리해야 한다.
+- DB의 이벤트 스케줄러: DB 안의 작업은 한 곳에서 관리된다. 로직이 DB 안으로 들어가는 5.15.3절의 단점이 그대로 있다.
+
+작은 규모에서는 서버 안의 타이머로 시작하고, 서버가 여러 대로 늘거나 작업이 무거워지면 별도 배치 프로그램으로 옮기는 것이 일반적이다.
+
+### 5.16.2 배치 작업의 설계 원칙
+
+- 멱등성: 두 번 실행해도 결과가 같아야 한다. "오늘 날짜의 초기화를 이미 했는가"를 DB에 기록하고, 이미 했으면 건너뛴다. 서버가 작업 도중 죽어서 다시 시작해도 안전하다.
+- 중복 실행 방지: 같은 작업이 동시에 두 번 돌면 안 된다. MySQL의 이름 있는 잠금(GET_LOCK)이나 Redis의 `SET 키 값 NX PX 시간`(5.10절)으로 한 곳만 실행하게 한다. GET_LOCK은 연결 단위의 잠금이므로 연결 풀을 쓸 때는 잠그고 푸는 동안 같은 연결을 써야 한다.
+- 나누어 처리: 100만 행을 한 문장으로 갱신하거나 삭제하면 오래 잠기고 복제가 밀린다. 1,000건씩 나누어 처리하고 그 사이에 짧게 쉬어서 서비스 질의를 방해하지 않게 한다.
+- 실패와 기록: 시작과 종료 시각, 처리 건수, 실패 원인을 로그로 남긴다. 실패하면 경보를 보내고 재시도 규칙을 정한다.
+- 시간 기준: 일일 초기화 기준 시각(예: 한국 시간 오전 5시)과 시간대를 정하고 코드와 DB에서 일관되게 쓴다. 서비스 시간이 몰리는 때를 피한다.
+
+우편 테이블 mail(mail_id, account_id, …, expire_at)이 있다고 가정한다. expire_at에 인덱스를 두고 EXPLAIN(5.8.3절)으로 쓰이는지 확인한다. 인덱스가 없으면 반복할 때마다 테이블 전체를 훑는다.
+
+```sql
+-- 만료된 우편을 1,000건씩 지운다 (MySQL). 영향받은 행이 1,000건 미만이 될 때까지 반복한다.
+DELETE FROM mail WHERE expire_at < NOW() ORDER BY mail_id LIMIT 1000;
+```
+
+### 5.16.3 서버 안의 주기 작업 예
+
+서비스 날짜가 바뀌었는지 확인하는 코드는 두 부분으로 나눈다. 날짜 계산은 서버의 시스템 시간대에 의존하지 않도록 UTC에 9시간(한국)을 더하고 5시간(초기화 기준)을 빼서 구하는 순수 함수이며, 별도 헤더에 둔다.
+
+```cpp
+// GameTime.h — 서비스 날짜 계산 (네트워크와 무관한 순수 함수)
+#pragma once
+#include <chrono>
+
+inline long long GameDay(std::chrono::system_clock::time_point tp)     // 한국 시간 오전 5시를 하루의 시작으로 본다
+{
+    using namespace std::chrono;
+    return floor<days>(tp + hours(9) - hours(5)).time_since_epoch().count();
+}
+```
+
+Asio 타이머로 1분마다 날짜를 확인하는 코드는 다음과 같다.
+
+```cpp
+#include <asio.hpp>
+#include <chrono>
+#include "GameTime.h"
+using namespace std::chrono;
+
+void WatchDayChange(asio::steady_timer& timer, long long& lastDay)
+{
+    timer.expires_after(seconds(60));                   // 1분마다 확인한다
+    timer.async_wait([&timer, &lastDay](std::error_code ec) {
+        if (ec) return;                                 // 취소된 경우
+        long long today = GameDay(system_clock::now());
+        if (today != lastDay)
+        {
+            lastDay = today;                            // DB에도 기록한다
+            RunDailyReset();                            // 한 번만 실행되어야 한다
+        }
+        WatchDayChange(timer, lastDay);
+    });
+}
+```
+
+이 코드를 시험할 때는 주기를 1초로 줄이고, 시작 2초 뒤부터 `GameDay`에 넘기는 시각에 24시간을 더해 하루가 지난 것처럼 만들었다. `RunDailyReset`은 "daily reset"을 출력하게 했고, 5초 동안 한 번만 출력되었다.
+
+lastDay의 처음 값은 서버를 시작할 때의 날짜가 아니라 DB에 저장해 둔 "마지막으로 처리한 날짜"를 읽어서 정한다. 서버가 날짜가 바뀌는 시각에 꺼져 있었더라도 다시 시작했을 때 초기화가 한 번 실행된다. 서버가 여러 대이면 5.16.2절의 중복 실행 방지를 함께 적용한다. GameDay 함수는 네트워크와 무관한 순수 함수이므로 단위 시험으로 경계(오전 4시 59분과 5시 정각)를 확인할 수 있다(6.13.2절).
+
+## 5.17 5장 연습 문제
 
 1. 계정, 인벤토리, 랭킹, 접속 세션, 전투 로그 각각에 알맞은 저장소를 고르고 이유를 한 줄로 써라.
 2. 두 요청이 동시에 같은 계정의 재화 500을 차감하려 한다(잔액 600). SELECT 후 서버에서 비교하는 방식과 UPDATE ... WHERE gold >= 500 방식의 결과를 비교하라.
@@ -504,3 +762,11 @@ CAP 정리는 네트워크가 나뉘는 상황(Partition)에서 일관성(Consis
 5. Cache-Aside 방식에서 캐시와 DB가 어긋나는 상황 한 가지를 들고 완화 방법을 쓰라.
 6. 계정 번호 해시로 샤딩한 환경에서 두 계정 사이의 거래를 안전하게 처리하는 Saga 절차를 단계별로 쓰라.
 7. 서버가 갑자기 종료될 때 최근 5분 동안의 플레이 기록이 사라지는 것을 허용할 수 있는지 논하고, 허용할 수 없는 항목은 어떻게 저장할지 제안하라.
+8. 5.8.4절의 ERD에 "길드 창고"(길드원이 함께 쓰는 아이템 보관함)를 추가하라. 필요한 테이블과 관계(1:N, N:M)를 ERD로 그리고, 각 테이블이 제3정규형을 만족하는지 확인하라.
+9. player 테이블에 길드 이름(guild_name) 열을 더해 이름을 중복 저장했다고 하자. 길드 이름이 바뀔 때 생기는 갱신 이상을 설명하고, 이 구조와 guild 테이블의 member_count 열(반정규화) 중 어느 쪽이 더 위험한지 비교하라.
+10. 5.15절의 guild와 player 테이블에 데이터를 넣고 길드별 인원과 평균 레벨을 구하라. 레벨 10 이상인 캐릭터만 세는 조건과 인원이 5명 이상인 길드만 남기는 조건을 각각 WHERE와 HAVING 중 어디에 써야 하는지 정하고 실행해서 확인하라.
+11. "아이템 1001을 가진 적이 없는 캐릭터"를 NOT EXISTS와 LEFT JOIN으로 각각 쓰고 결과가 같은지 확인하라.
+12. 5.15.3절의 sp_transfer_gold에서 두 지갑을 계정 번호 순서로 잠그는 두 줄을 지우면, A에서 B로 보내는 요청과 B에서 A로 보내는 요청이 동시에 실행될 때 어떤 일이 생길 수 있는지 설명하라. 결과 코드 1, 2, 3, -1을 받은 서버가 각각 사용자에게 무엇을 응답하고 다시 시도할지 정하라.
+13. 규칙 판정을 서버 코드에 두는 방식과 저장 프로시저에 두는 방식을 시험, 배포, 확장, 권한 관리의 네 가지 면에서 비교하라. 자신의 서버에서 프로시저로 옮길 처리가 있는지, 없다면 이유가 무엇인지 쓰라.
+14. 5.7절의 game_result 테이블에 10만 행을 넣고 느린 질의 하나를 골라 5.15.4절의 네 단계로 개선하라. 개선 전후의 실행 시간과 읽은 행 수를 같은 데이터로 기록한다.
+15. "매일 오전 5시에 모든 계정의 출석 횟수를 0으로 만든다"는 작업을 5.16.2절의 원칙(멱등성, 중복 실행 방지, 나누어 처리)에 따라 설계하라. 서버 두 대가 같은 시각에 이 작업을 시작할 때와, 작업 도중 서버가 죽었다가 다시 시작할 때 각각 어떻게 동작하는지 순서대로 써라.

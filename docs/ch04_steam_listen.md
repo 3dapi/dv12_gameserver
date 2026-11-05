@@ -351,7 +351,7 @@ Unity Netcode for GameObjects의 기본 Transport인 Unity Transport가 Steam �
 
 ### 4.7.1 Unity 단계별 실습
 
-**[검증 방식]** 2장의 채팅 GUI 씬(ChatScene)을 그대로 사용한다. 씬에 Steam 패널(로비 만들기, 로비 찾기, 참가, 친구 초대 버튼과 로비 목록 Text)을 하나 추가하고, 접속 이후의 채팅·채널·보너스 시험은 2장 패널을 그대로 사용한다. 연결 경로만 Unity Transport에서 Steam으로 바뀌므로 2장의 시험 항목이 같은 결과로 나와야 한다. 이 절의 Steamworks.NET은 Steamworks SDK의 C# 래퍼이다.
+**[검증 방식]** 2장의 채팅 GUI 씬(ChatScene, 2.11절)을 그대로 사용한다. 씬에 Steam 패널(로비 만들기, 로비 찾기, 참가, 친구 초대 버튼과 로비 목록 Text)을 하나 추가하고, 접속 이후의 채팅·채널·보너스 시험은 2장 패널을 그대로 사용한다. 연결 경로만 Unity Transport에서 Steam으로 바뀌므로 2장의 시험 항목이 같은 결과로 나와야 한다. 이 절의 Steamworks.NET은 Steamworks SDK의 C# 래퍼이다.
 
 실습 1 — Steamworks.NET 설치와 초기화: 패키지를 설치하고 Steam이 초기화되었는지 GUI의 상태 Text에 표시한다.
 
@@ -445,9 +445,9 @@ public class SteamLobbyPanel : MonoBehaviour
 
 **[확인할 것]** PC 두 대(서로 다른 Steam 계정)에서 한쪽이 로비를 만들고 다른 쪽이 찾기 또는 초대로 입장하는지, 입장한 쪽의 HostSteamId가 호스트의 SteamID와 같은지 확인한다. 이 단계에서는 NetworkManager를 시작하지 않는다. 로비 입장은 게임 연결이 아니다.
 
-실습 3 — NGO 연결을 Steam으로: 로비를 만든 쪽이 StartHost, 입장한 쪽이 호스트 SteamID를 Transport에 지정하고 StartClient를 호출한다. 이후 2장의 연결 패널과 채팅 패널은 수정하지 않는다.
+실습 3 — NGO 연결을 Steam으로: 로비를 만든 쪽이 StartHost, 입장한 쪽이 호스트 SteamID를 Transport에 지정하고 StartClient를 호출한다. 이후 2장의 연결 패널과 채팅 패널은 수정하지 않는다. [2장과의 대응: 연결 패널은 2.5.4절의 `NetStarter`와 2.10.4절의 `JoinPanel`, 채팅 패널은 2.11.4절의 `ChatLogPanel`과 `ChatInputPanel`이다. 접속 버튼이 주소·포트 대신 로비 정보를 쓰게 하는 부분만 아래 구현 순서 2번에서 바뀐다(2.19.3절).]
 
-**[구현 순서]** 1. Steam 연결을 지원하는 NGO Transport 구현체를 프로젝트에 추가하고 NetworkManager의 Network Transport에 지정한다[사용 구현체와 호환 NGO 버전을 확인하여 기재]. 2. 접속 버튼의 동작을 Steam 모드에서는 로비 정보를 이용하도록 바꾼다. 3. 2장의 ConnectionApprovalCallback(이름|인증 코드)을 그대로 사용한다.
+**[구현 순서]** 1. Steam 연결을 지원하는 NGO Transport 구현체를 프로젝트에 추가하고 NetworkManager의 Network Transport에 지정한다[사용 구현체와 호환 NGO 버전을 확인하여 기재]. 2. 접속 버튼의 동작을 Steam 모드에서는 로비 정보를 이용하도록 바꾼다. 3. 2장의 ConnectionApprovalCallback(이름|인증 코드, 2.10.4절의 `ApprovalGate`)을 그대로 사용한다.
 
 ```csharp
 // 호스트: 로비 생성 직후
@@ -459,7 +459,7 @@ transport.TargetSteamId = steamLobbyPanel.HostSteamId;
 NetworkManager.Singleton.StartClient();
 ```
 
-**[확인할 것]** 2장 시험을 같은 순서로 반복한다. 올바른 인증 코드로 접속, 틀린 코드·중복 이름 거부, 정원 초과, 채팅 중계, 채널, 보너스 요청과 응답, 가상 이동이 Steam 연결에서도 같은 결과인지 비교한다.
+**[확인할 것]** 2장 시험(2.10.4절, 2.11절)을 같은 순서로 반복한다. 올바른 인증 코드로 접속, 틀린 코드·중복 이름 거부, 정원 초과, 채팅 중계, 채널, 보너스 요청과 응답, 가상 이동이 Steam 연결에서도 같은 결과인지 비교한다.
 
 실습 4 — 호스트 종료와 접속 실패: 호스트가 종료되면 세션이 끝난다는 Listen Server의 특성을 화면으로 확인한다. 클라이언트는 연결이 끊기면 사유를 상태 Text에 표시하고 로비를 떠난다.
 
