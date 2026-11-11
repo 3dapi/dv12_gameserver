@@ -1,0 +1,17 @@
+[Unit]
+Description=Chat Game Server
+After=network.target
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+User=gameserver
+WorkingDirectory=/opt/chatserver
+ExecStart=/opt/chatserver/ChatServer /opt/chatserver/server.ini
+Restart=on-failure
+RestartSec=3
+LimitNOFILE=65536
+LimitCORE=infinity
+
+[Install]
+WantedBy=multi-user.target
